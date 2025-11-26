@@ -1,18 +1,3 @@
-# finsight_streamlit.py
-"""
-FinSight — Realtime-first (improved LLM + caching + fallbacks)
-
-Improvements since previous:
-- Resolves free-text company names -> ticker symbols (FAANG, major US + Indian blue-chips).
-- Prefers realtime yfinance (history + news); falls back to Google News RSS and local ./data & ./news.
-- Robust LLM calling: retries, alternate host attempt (common Ollama port 14088).
-- Cache/save realtime history/news to ./data and ./news (configurable via AUTO_SAVE_FETCHED).
-- Fixes to timestamp function and JSON handling for metadata printing.
-- Adds chart: past 30 days of actual closes + next 30-day recursive LSTM forecast (if model available).
-
-Run:
-    AUTO_SAVE_FETCHED=1 LLM_HOST=http://127.0.0.1:14088 streamlit run finsight_streamlit.py
-"""
 import os
 import json
 import re
@@ -31,25 +16,19 @@ import requests
 import feedparser
 from bs4 import BeautifulSoup
 
-# plotting
 import matplotlib.pyplot as plt
 
-# ML / LSTM
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-# NLP fallback
 from textblob import TextBlob
 
-# yfinance (realtime preferred)
 import yfinance as yf
 import yfinance.exceptions as yfe
 
-# small fuzzy helper
 import difflib
 
-# Load environment variables
 load_dotenv()
 
 # ---------------------------
@@ -148,7 +127,6 @@ def company_name_to_ticker(name: str, prefer_market: Optional[str] = None) -> Op
 
     name_stripped = name.strip()
 
-    # 1) normalized direct mapping
     n = _normalize_name(name)
     if n in NORMALIZED_NAME_TO_TICKER:
         cand = NORMALIZED_NAME_TO_TICKER[n]
@@ -159,18 +137,15 @@ def company_name_to_ticker(name: str, prefer_market: Optional[str] = None) -> Op
                 return alt
         return cand
 
-    # 2) token containment
     tokens = [t for t in re.split(r"\s+|[,/&-]", n) if t]
     for key, tk in NORMALIZED_NAME_TO_TICKER.items():
         if all(tok in key for tok in tokens):
             return tk
 
-    # 3) fuzzy match
     candidates = difflib.get_close_matches(n, NORMALIZED_NAME_TO_TICKER.keys(), n=3, cutoff=0.7)
     if candidates:
         return NORMALIZED_NAME_TO_TICKER[candidates[0]]
 
-    # 4) strip suffixes and retry fuzzy
     klein = re.sub(r"\b(inc|incorporated|ltd|limited|corp|corporation|co|plc|private)\b", "", n).strip()
     if klein and klein != n:
         if klein in NORMALIZED_NAME_TO_TICKER:
@@ -179,14 +154,12 @@ def company_name_to_ticker(name: str, prefer_market: Optional[str] = None) -> Op
         if candidates:
             return NORMALIZED_NAME_TO_TICKER[candidates[0]]
 
-    # 5) last resort: accept literal ticker-looking input only if uppercase or has dot
     if re.fullmatch(r"[A-Za-z0-9\-]{1,8}(\.[A-Za-z]{1,3})?", name_stripped):
         looks_upper = (name_stripped == name_stripped.upper())
         has_dot = "." in name_stripped
         if looks_upper or has_dot:
             return name_stripped.upper()
 
-    # not found
     return None
 
 # ---------------------------
@@ -508,7 +481,6 @@ def build_sequences(df: pd.DataFrame, feature_cols: List[str], window:int=60, ho
 
 @st.cache_resource(show_spinner=False)
 def train_lstm_for_ticker(ticker: str, window:int=60, horizon:int=7, epochs:int=8, lr:float=1e-3, hidden_size:int=32) -> Tuple[SimpleLSTM, Dict[str,Any]]:
-    # Prefer realtime 5y history
     df, err = fetch_history_realtime(ticker, period="5y")
     if err or df is None or df.empty or len(df) < (window + horizon + 10):
         df1, err1 = fetch_history_realtime(ticker, period="1y")
@@ -723,13 +695,11 @@ def evaluate_candidates_by_news(candidates: List[str], top_k:int=3) -> List[Dict
 # Streamlit UI (RESOLVE company names -> ticker BEFORE doing work)
 # ---------------------------
 st.set_page_config(page_title="FinSight — Realtime-first", layout="wide")
-st.title("FinSight — AI-Powered Stock Advisor (Realtime-first)")
+st.title("FinSight — An Multi Source AI Engine For Stock Trend Forcasting")
 
 st.markdown(f"""
-This demo **prefers realtime data from yfinance** (history + news). If realtime fetches fail (rate limits / network),
+This demo **prefers realtime data from yfinance**. If realtime fetches fail (rate limits / network),
 it falls back to **Google News RSS** for headlines and then to **local files** under `{DATA_DIR}` and `{NEWS_DIR}` for history/news.
-
-**NOT financial advice.** Demo only.
 """)
 st.header("Query & Prediction")
 mode = st.radio("Mode:", ["Search ticker", "Best upcoming stock (big companies)"])
@@ -828,10 +798,7 @@ if mode == "Search ticker":
                     fig, ax = plt.subplots(figsize=(10, 4))
                     ax.plot(past_30.index, past_30.values, label="Past 30 Days", linewidth=2)
 
-                    # If there's a trained model + meta, produce recursive 30-day forecast
                     if model is not None and meta is not None:
-                        # Build features and last window
-                        # We need at least 'window' rows; otherwise we won't forecast
                         window = int(meta.get("window", 60))
                         feature_cols = meta.get("feature_cols", ["Close", "Volume", "pct_change", "sma10", "sma20", "rsi14", "vol_change"])
                         df_for_feat = compute_technical_indicators(hist_df.copy())
@@ -841,11 +808,9 @@ if mode == "Search ticker":
                             std = np.squeeze(np.array(meta["std"]), axis=0) + 1e-8
                             seq_buffer = (recent_window - mean) / std  # normalized shape (window, features)
 
-                            # recursive forecast
                             future_points = 30
                             future_prices = []
                             current_close = hist_df["Close"].iloc[-1]
-                            # a simple placeholder volume for predicted rows: use last known volume (not predicted)
                             last_vol = float(hist_df["Volume"].iloc[-1]) if "Volume" in hist_df.columns else 0.0
 
                             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -855,18 +820,11 @@ if mode == "Search ticker":
                                 xb = torch.from_numpy(seq_buffer[None, :, :]).float().to(device)
                                 with torch.no_grad():
                                     pred = model(xb).cpu().numpy().squeeze()
-                                # pred is pct change (not percentage). In training we used raw fractional change,
-                                # in predict_with_lstm we multiplied by 100 for readability; here use raw pred.
-                                # If model was trained to output fractional change, apply:
-                                # next_price = current_close * (1 + pred)
                                 try:
                                     next_price = float(current_close) * (1.0 + float(pred))
                                 except Exception:
-                                    # if model outputs scaled differently, be defensive
                                     next_price = float(current_close) * (1.0 + float(pred))
                                 future_prices.append(next_price)
-
-                                # craft next feature row (best-effort): Close, Volume, pct_change, sma10/sma20 placeholders, rsi14 placeholder, vol_change placeholder
                                 pct_change = float(pred)
                                 sma10 = next_price
                                 sma20 = next_price
